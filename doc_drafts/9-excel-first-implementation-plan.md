@@ -51,6 +51,11 @@ Charge-off Rate = Charge-off $ / Beginning Balance $
 **Calculated Field:**
 - **Ending_Balance**: Beginning - Payments - Chargeoffs
 
+**Critical Logic:**
+- For historical data: Ending_Balance[t] should equal Beginning_Balance[t+1]
+- For forecasts: Beginning_Balance[t+1] = Ending_Balance[t]
+- For new vintages: Beginning_Balance[1] = Input parameter (e.g., $1M)
+
 **Nice to Have:**
 - **Loan_Count**: For per-loan analytics (but not critical Day 1)
 
@@ -78,11 +83,21 @@ For each Month_Age where Is_Actual = 1:
   Chargeoff_Rate[Age] = AVG(Chargeoff_Amt / Beginning_Balance)
 ```
 
-**Step 2: Use Recent Cohorts for Early Months**
-- Months 1-6: Average of last 12 cohorts
-- Months 7-12: Average of last 6 cohorts  
-- Months 13-24: Average of last 3 cohorts
-- Months 25+: Use mature cohort average
+**Step 2: Excel Implementation for Weighted Averages**
+
+For Month_Age = X:
+```excel
+=IF(COUNTIFS($B:$B,X,$H:$H,1)>=12,
+    SUMPRODUCT((MOD(ROW($A:$A)-ROW($A$2),24)=X-1)*($H:$H=1)*($D:$D))/
+    SUMPRODUCT((MOD(ROW($A:$A)-ROW($A$2),24)=X-1)*($H:$H=1)*($C:$C)),
+    AVERAGEIFS($D:$D/$C:$C,$B:$B,X,$H:$H,1))
+```
+
+Simpler approach - use helper columns:
+- Months 1-6: Average of all available data at that age
+- Months 7-12: Average of all available data at that age
+- Months 13-24: Average of all available data at that age
+- Months 25-144: Use last observed rate or decay to zero
 
 ---
 
@@ -95,22 +110,29 @@ For each Month_Age where Is_Actual = 1:
 
 ### Sheet 2: "Rate_Analysis"
 ```
-| Month_Age | Obs_Count | Avg_Pay_Rate | Avg_CO_Rate | StdDev_Pay | StdDev_CO |
-|-----------|-----------|--------------|-------------|------------|-----------|
-| 1         | 24        | 2.00%        | 0.50%       | 0.10%      | 0.05%     |
-| 2         | 24        | 2.00%        | 0.49%       | 0.09%      | 0.04%     |
-| 3         | 23        | 1.95%        | 0.48%       | 0.11%      | 0.05%     |
+| Month_Age | Vintage_Count | Payment_Rate | CO_Rate |
+|-----------|---------------|--------------|---------|
+| 1         | 24            | 2.00%        | 0.50%   |
+| 2         | 24            | 2.00%        | 0.49%   |
+| 3         | 23            | 1.95%        | 0.48%   |
 ```
 
 ### Sheet 3: "Forecast_Rates"
 ```
-| Month_Age | Payment_Rate | CO_Rate | Source        |
-|-----------|--------------|---------|---------------|
-| 1         | 2.00%        | 0.50%   | Historical    |
-| 2         | 2.00%        | 0.49%   | Historical    |
-| ...       | ...          | ...     | ...           |
-| 25        | 1.50%        | 0.30%   | Projected     |
+| Month_Age | Payment_Rate | CO_Rate | Source        | Logic                    |
+|-----------|--------------|---------|---------------|---------------------------|
+| 1         | 2.00%        | 0.50%   | Historical    | From Rate_Analysis       |
+| 2         | 2.00%        | 0.49%   | Historical    | From Rate_Analysis       |
+| ...       | ...          | ...     | ...           | ...                      |
+| 24        | 1.60%        | 0.40%   | Historical    | From Rate_Analysis       |
+| 25        | 1.50%        | 0.35%   | Extended      | Month 24 rate * 0.95     |
+| ...       | ...          | ...     | ...           | ...                      |
+| 144       | 0.10%        | 0.05%   | Extended      | Decay formula            |
 ```
+
+**Extension Logic (Months 25-144):**
+- Payment_Rate[t] = Payment_Rate[24] * 0.95^((t-24)/12)
+- CO_Rate[t] = CO_Rate[24] * 0.90^((t-24)/12)
 
 ### Sheet 4: "Forecast_Output"
 ```
@@ -131,14 +153,32 @@ For each Month_Age where Is_Actual = 1:
    - Beginning_Balance > 0
    - Ending_Balance = Beginning - Payments - CO
    - Is_Actual in (0,1)
+   - Payment_Amt <= Beginning_Balance
+   - Chargeoff_Amt <= Beginning_Balance
+   - Payment_Amt + Chargeoff_Amt <= Beginning_Balance
+   
+4. Data quality helper columns:
+   - Balance_Check: `=ABS(F2-(C2-D2-E2))<0.01`
+   - Rate_Check: `=(D2+E2)/C2<=1`
+   - Flag anomalies with conditional formatting
 
 ### Hour 3-4: Historical Rate Calculation
-1. Build Rate_Analysis sheet:
+1. Build Rate_Analysis sheet with correct formulas:
+   
+   For Payment_Rate (assuming Month_Age in A2):
    ```excel
-   =AVERAGEIFS(Raw_Data!D:D/Raw_Data!C:C, Raw_Data!B:B, A2, Raw_Data!H:H, 1)
+   =SUMIFS(Raw_Data!$D:$D, Raw_Data!$B:$B, A2, Raw_Data!$H:$H, 1) / 
+    SUMIFS(Raw_Data!$C:$C, Raw_Data!$B:$B, A2, Raw_Data!$H:$H, 1)
    ```
-2. Calculate observation counts
-3. Add standard deviation for volatility check
+   
+   For CO_Rate:
+   ```excel
+   =SUMIFS(Raw_Data!$E:$E, Raw_Data!$B:$B, A2, Raw_Data!$H:$H, 1) / 
+    SUMIFS(Raw_Data!$C:$C, Raw_Data!$B:$B, A2, Raw_Data!$H:$H, 1)
+   ```
+   
+2. Count vintages: `=COUNTIFS(Raw_Data!$B:$B, A2, Raw_Data!$H:$H, 1)`
+3. Handle division by zero with IFERROR wrapper
 
 ## Day 1: Afternoon (4 hours)
 
@@ -160,20 +200,38 @@ For each Month_Age where Is_Actual = 1:
 ## Day 2: Polish and Validate
 
 ### Morning: Lifetime Expectation Integration
-1. Add input cell for lifetime CO% (e.g., 20%)
+1. Add input parameters:
+   - Lifetime_CO_Rate: 20% (example)
+   - Loan_Term_Months: 144
+   - Curve_Shape: 1.2 (adjustable)
+   
 2. Create monthly target curve:
+   ```excel
+   Cumulative_CO_Target[t] = Lifetime_CO_Rate * (t / Loan_Term_Months)^Curve_Shape
+   Monthly_CO_Target[t] = Cumulative_CO_Target[t] - Cumulative_CO_Target[t-1]
    ```
-   Month 18 Target = 20% * (18/144)^1.5
-   ```
-3. Show actual vs. target variance
+   
+3. Blend forecast rates with lifetime expectations:
+   - Weight_Historical = MIN(1, Vintage_Count / 6)
+   - Weight_Lifetime = 1 - Weight_Historical
+   - Blended_CO_Rate = Historical_Rate * Weight_Historical + Target_Rate * Weight_Lifetime
 
 ### Afternoon: Make It Production-Ready
 1. Add control panel:
-   - Segment selector
-   - Forecast start date
-   - Rate override options
-2. Create one-click forecast update
-3. Format for PowerBI consumption
+   - Input_Starting_Balance (e.g., $1,000,000)
+   - Segment_Name (text field)
+   - Forecast_Start_Vintage (e.g., 2025-01)
+   - Rate override options (optional)
+   
+2. Create one-click forecast update:
+   - Clear previous forecast
+   - Apply rates to new vintage
+   - Generate 144-month projection
+   
+3. Format output table for easy export:
+   - Consistent column headers
+   - No merged cells
+   - Date formatting for vintages
 
 ---
 
@@ -217,5 +275,21 @@ rates = df[df['Is_Actual']==1].groupby('Month_Age').agg({
 ❌ Balances going negative  
 ❌ Forecast curves with sharp jumps  
 ❌ Overly complex formulas
+
+### Rate Application Method (Recommendation)
+
+**Use Beginning Balance Method:**
+```
+Payment_Amt[t] = Beginning_Balance[t] * Payment_Rate[t]
+Chargeoff_Amt[t] = Beginning_Balance[t] * CO_Rate[t]
+Ending_Balance[t] = Beginning_Balance[t] - Payment_Amt[t] - Chargeoff_Amt[t]
+Beginning_Balance[t+1] = Ending_Balance[t]
+```
+
+**Why Beginning Balance:**
+1. Matches industry standard practice
+2. Prevents circular references in Excel
+3. Easier to audit and validate
+4. Consistent with how rates were calculated historically
 
 **Remember:** You're building a working prototype, not a perfect system. Excel first, Python second, perfection never.
